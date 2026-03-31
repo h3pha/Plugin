@@ -63,6 +63,47 @@ var Settings = {
         }, 2000);
     },
 
+    showSyncModeDialog: function() {
+        var self = this;
+        return new Promise(function(resolve) {
+            if (!self.dialog) {
+                resolve(null);
+                return;
+            }
+
+            var existing = self.dialog.querySelector('.moonfin-sync-choice-backdrop');
+            if (existing) existing.remove();
+
+            var backdrop = document.createElement('div');
+            backdrop.className = 'moonfin-sync-choice-backdrop';
+            backdrop.innerHTML =
+                '<div class="moonfin-sync-choice-modal" role="dialog" aria-modal="true" aria-labelledby="moonfin-sync-choice-title">' +
+                    '<h3 id="moonfin-sync-choice-title">Choose Sync Direction</h3>' +
+                    '<p>Pick how to sync this account\'s Moonfin profiles.</p>' +
+                    '<div class="moonfin-sync-choice-actions">' +
+                        '<button type="button" class="moonfin-panel-btn moonfin-panel-btn-primary" data-choice="push">Push to Profile</button>' +
+                        '<button type="button" class="moonfin-panel-btn moonfin-panel-btn-ghost" data-choice="pull">Pull from Profile</button>' +
+                        '<button type="button" class="moonfin-panel-btn moonfin-panel-btn-ghost" data-choice="cancel">Cancel</button>' +
+                    '</div>' +
+                '</div>';
+
+            var cleanup = function(choice) {
+                if (backdrop && backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
+                resolve(choice);
+            };
+
+            backdrop.addEventListener('click', function(e) {
+                if (e.target === backdrop) cleanup(null);
+            });
+
+            backdrop.querySelector('[data-choice="push"]').addEventListener('click', function() { cleanup('push'); });
+            backdrop.querySelector('[data-choice="pull"]').addEventListener('click', function() { cleanup('pull'); });
+            backdrop.querySelector('[data-choice="cancel"]').addEventListener('click', function() { cleanup(null); });
+
+            self.dialog.appendChild(backdrop);
+        });
+    },
+
     saveSetting: function(name, value) {
         var profileName = Storage.getActiveEditProfile();
         var profile = Storage.getProfile(profileName);
@@ -103,9 +144,10 @@ var Settings = {
     },
 
     createRangeCard: function(id, title, description, min, max, step, currentValue, suffix) {
+        var rangeSuffix = suffix || '';
         return '<div class="moonfin-select-card">' +
             '<div class="moonfin-select-info">' +
-                '<div class="moonfin-toggle-title">' + title + ' <span class="moonfin-range-value" data-for="' + id + '">' + currentValue + (suffix || '') + '</span></div>' +
+                '<div class="moonfin-toggle-title">' + title + ' <span class="moonfin-range-value" data-for="' + id + '" data-suffix="' + rangeSuffix + '">' + currentValue + rangeSuffix + '</span></div>' +
                 (description ? '<div class="moonfin-toggle-desc">' + description + '</div>' : '') +
             '</div>' +
             '<input type="range" id="moonfin-' + id + '" name="' + id + '" min="' + min + '" max="' + max + '" step="' + step + '" value="' + currentValue + '" class="moonfin-panel-range">' +
@@ -345,6 +387,10 @@ var Settings = {
             '<div class="moonfin-color-preview" id="moonfin-color-preview" style="background:' + Storage.getColorHex(settings.mediaBarOverlayColor) + '"></div>' +
             this.createRangeCard('mediaBarOpacity', 'Overlay Opacity', 'Transparency of the gradient overlay', 0, 100, 5, settings.mediaBarOpacity, '%');
 
+        var detailsContent =
+            this.createRangeCard('detailsBackdropOpacity', 'Backdrop Opacity', 'Controls how dark the details background image is', 0, 100, 1, settings.detailsBackdropOpacity, '%') +
+            this.createRangeCard('detailsBackdropBlur', 'Backdrop Blur', 'Adds blur to the details background image', 0, 40, 1, settings.detailsBackdropBlur, 'px');
+
         var toolbarContent =
             this.createToggleCard('showShuffleButton', 'Shuffle Button', 'Show random content button in the toolbar', settings.showShuffleButton) +
             this.createSelectCard('shuffleContentType', 'Shuffle Content Type', 'What type of content to shuffle', [
@@ -569,6 +615,7 @@ var Settings = {
                     this.createSection('', 'Moonfin UI', uiContent, true) +
                     this.createSection('', 'Media Bar', mediaBarContent) +
                     this.createSection('', 'Overlay Appearance', overlayContent) +
+                    this.createSection('', 'Details Appearance', detailsContent) +
                     this.createSection('', 'Toolbar Buttons', toolbarContent) +
                     this.createSection('', 'Display', displayContent) +
                     this.createSection('', 'TMDB Episode Ratings', tmdbContent) +
@@ -642,7 +689,10 @@ var Settings = {
             if (rName in resolved) {
                 ranges[k].value = resolved[rName];
                 var valueSpan = this.dialog.querySelector('.moonfin-range-value[data-for="' + rName + '"]');
-                if (valueSpan) valueSpan.textContent = resolved[rName] + '%';
+                if (valueSpan) {
+                    var suffix = valueSpan.getAttribute('data-suffix') || '';
+                    valueSpan.textContent = resolved[rName] + suffix;
+                }
             }
         }
 
@@ -807,17 +857,55 @@ var Settings = {
 
         this.dialog.querySelector('.moonfin-settings-sync').addEventListener('click', function() {
             var syncBtn = self.dialog.querySelector('.moonfin-settings-sync');
-            syncBtn.disabled = true;
-            syncBtn.textContent = 'Syncing...';
+            self.showSyncModeDialog().then(function(syncChoice) {
+                if (!syncChoice) {
+                    self.showToast('Sync canceled');
+                    return;
+                }
 
-            Storage.sync(true).then(function() {
-                return self.updateSyncStatus();
-            }).then(function() {
-                syncBtn.disabled = false;
-                syncBtn.textContent = 'Sync';
-                self.showToast('Settings synced from server');
-                self.hide();
-                setTimeout(function() { self.show(); }, 350);
+                syncBtn.disabled = true;
+                syncBtn.textContent = 'Syncing...';
+
+                var op;
+                if (syncChoice === 'push') {
+                    var localProfiles = Storage.getProfiles();
+                    op = Storage.pingServer().then(function(ping) {
+                        if (!Storage.isSyncEnabled() || !ping || !ping.installed || !ping.settingsSyncEnabled) {
+                            return false;
+                        }
+                        return Storage.saveAllProfilesToServer(localProfiles);
+                    }).then(function(ok) {
+                        if (ok) Storage.saveSnapshot(localProfiles);
+                        return ok;
+                    });
+                } else {
+                    op = Storage.pingServer().then(function(ping) {
+                        if (!Storage.isSyncEnabled() || !ping || !ping.installed || !ping.settingsSyncEnabled) {
+                            return false;
+                        }
+                        return Storage.sync(true).then(function() { return true; });
+                    });
+                }
+
+                return op.then(function(ok) {
+                    return self.updateSyncStatus().then(function() { return ok; });
+                }).then(function(ok) {
+                    syncBtn.disabled = false;
+                    syncBtn.textContent = 'Sync';
+
+                    if (!ok) {
+                        self.showToast('Sync failed');
+                        return;
+                    }
+
+                    self.showToast(syncChoice === 'pull' ? 'Pulled settings from profile' : 'Pushed settings to profile');
+                    self.hide();
+                    setTimeout(function() { self.show(); }, 350);
+                }).catch(function() {
+                    syncBtn.disabled = false;
+                    syncBtn.textContent = 'Sync';
+                    self.showToast('Sync failed');
+                });
             });
         });
 
@@ -888,7 +976,8 @@ var Settings = {
                 range.addEventListener('input', function() {
                     var valueSpan = self.dialog.querySelector('.moonfin-range-value[data-for="' + range.name + '"]');
                     if (valueSpan) {
-                        valueSpan.textContent = range.value + '%';
+                        var suffix = valueSpan.getAttribute('data-suffix') || '';
+                        valueSpan.textContent = range.value + suffix;
                     }
                 });
                 range.addEventListener('change', function() {

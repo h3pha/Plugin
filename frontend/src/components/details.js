@@ -2,12 +2,24 @@ var Details = {
     container: null,
     currentItem: null,
     isVisible: false,
+    _itemHistory: [],
+    _navigatingBack: false,
+    _trailerOverlay: null,
+    _trailerEscHandler: null,
+    _trailerPreviousFocus: null,
+    _trailerPlayer: null,
+    _settingsChangedHandler: null,
 
     init: function() {
-        console.log('[Moonfin] Details: Initializing...');
         this.createContainer();
         this.setupItemInterception();
-        console.log('[Moonfin] Details: Initialized');
+        if (!this._settingsChangedHandler) {
+            var self = this;
+            this._settingsChangedHandler = function() {
+                self.applyBackdropSettings();
+            };
+            window.addEventListener('moonfin-settings-changed', this._settingsChangedHandler);
+        }
     },
 
     createContainer: function() {
@@ -16,8 +28,27 @@ var Details = {
 
         this.container = document.createElement('div');
         this.container.className = 'moonfin-details-overlay';
-        this.container.innerHTML = '<div class="moonfin-details-panel"></div>';
+        this.container.innerHTML = '<div class="moonfin-details-backdrop"></div><div class="moonfin-details-panel"></div>';
         document.body.appendChild(this.container);
+        this.applyBackdropSettings();
+    },
+
+    applyBackdropSettings: function() {
+        var backdrop = this.container ? this.container.querySelector('.moonfin-details-backdrop') : null;
+        if (!backdrop) return;
+
+        var settings = Storage.getAll();
+        var opacity = parseInt(settings.detailsBackdropOpacity, 10);
+        if (isNaN(opacity)) opacity = 90;
+        opacity = Math.max(0, Math.min(100, opacity));
+
+        var blur = parseInt(settings.detailsBackdropBlur, 10);
+        if (isNaN(blur)) blur = 0;
+        blur = Math.max(0, Math.min(40, blur));
+
+        var dim = (100 - opacity) / 100;
+        backdrop.style.setProperty('--moonfin-details-backdrop-dim', dim.toFixed(2));
+        backdrop.style.filter = blur > 0 ? 'blur(' + blur + 'px)' : 'none';
     },
 
     setupItemInterception: function() {
@@ -132,6 +163,9 @@ var Details = {
             if (self.isVisible && (e.key === 'Escape' || e.keyCode === 27 || e.keyCode === 461 || e.keyCode === 10009)) {
                 e.preventDefault();
                 e.stopPropagation();
+                if (self.closeTrailerOverlay()) {
+                    return;
+                }
                 self.hide();
             }
         }, true);
@@ -179,22 +213,42 @@ var Details = {
         return null;
     },
 
+    goBack: function() {
+        if (this._itemHistory.length > 0) {
+            var prev = this._itemHistory.pop();
+            this._navigatingBack = true;
+            this.showDetails(prev.id, prev.type);
+            this._navigatingBack = false;
+        } else {
+            this.hide();
+        }
+    },
+
+    _updateBackButtons: function() {
+        var navbarBack = document.querySelector('.moonfin-details-nav-back');
+        var sidebarBack = document.querySelector('.moonfin-details-sidebar-back');
+        var show = this.isVisible;
+        if (navbarBack) navbarBack.style.display = show ? '' : 'none';
+        if (sidebarBack) sidebarBack.style.display = show ? '' : 'none';
+    },
+
     showDetails: function(itemId, itemType) {
         var self = this;
-        console.log('[Moonfin] Details: Loading item', itemId, itemType);
+        this.closeTrailerOverlay();
 
         var api = API.getApiClient();
-        if (!api) {
-            console.error('[Moonfin] Details: No API client');
-            return;
-        }
+        if (!api) return;
 
-        // Only push history state when first opening (not when navigating within overlay)
         var wasAlreadyVisible = this.isVisible;
+
+        if (wasAlreadyVisible && this.currentItem && this.currentItem.Id && this.currentItem.Id !== itemId && !this._navigatingBack) {
+            this._itemHistory.push({ id: this.currentItem.Id, type: this.currentItem.Type });
+        }
 
         this.container.classList.add('visible');
         this.isVisible = true;
         document.body.classList.add('moonfin-details-visible');
+        this._updateBackButtons();
 
         if (!wasAlreadyVisible) {
             history.pushState({ moonfinDetails: true }, '');
@@ -231,17 +285,21 @@ var Details = {
             var castPromise = Promise.resolve(item.People || []);
             var seasonsPromise = item.Type === 'Series' ? self.fetchSeasons(api, itemId).catch(function() { return []; }) : Promise.resolve([]);
             var episodesPromise = (item.Type === 'Episode' && item.SeasonId) ? self.fetchEpisodes(api, item.SeriesId, item.SeasonId).catch(function() { return []; }) : ((item.Type === 'Season' && item.SeriesId) ? self.fetchEpisodes(api, item.SeriesId, item.Id).catch(function() { return []; }) : Promise.resolve([]));
+            var featuresPromise = self.fetchSpecialFeatures(api, item).catch(function() { return []; });
+            var collectionsPromise = self.fetchCollectionItems(api, item).catch(function() { return null; });
 
-            return Promise.all([similarPromise, castPromise, seasonsPromise, episodesPromise]).then(function(results) {
+            return Promise.all([similarPromise, castPromise, seasonsPromise, episodesPromise, featuresPromise, collectionsPromise]).then(function(results) {
                 var similar = results[0];
                 var cast = results[1];
                 var seasons = results[2];
                 var episodes = results[3];
+                var features = results[4] || [];
+                var collections = results[5] || { title: '', items: [] };
                 
                 if (item.Type === 'Season') {
                     self.renderSeasonDetails(item, episodes);
                 } else {
-                    self.renderDetails(item, similar, cast, seasons, episodes);
+                    self.renderDetails(item, similar, cast, seasons, episodes, features, collections);
                 }
 
                 if (MdbList.isEnabled()) {
@@ -328,7 +386,127 @@ var Details = {
         });
     },
 
-    renderDetails: function(item, similar, cast, seasons, episodes) {
+    fetchSpecialFeatures: function(api, item) {
+        if (!item || !item.Id) return Promise.resolve([]);
+        if (!item.SpecialFeatureCount) return Promise.resolve([]);
+
+        var userId = api.getCurrentUserId();
+        var serverUrl = api._serverAddress || api.serverAddress();
+        var headers = this.getAuthHeaders();
+
+        return fetch(serverUrl + '/Users/' + userId + '/Items/' + item.Id + '/SpecialFeatures?Fields=PrimaryImageAspectRatio,UserData', {
+            headers: headers
+        }).then(function(resp) {
+            if (!resp.ok) throw new Error('Failed to fetch special features');
+            return resp.json();
+        }).then(function(result) {
+            if (Array.isArray(result)) return result;
+            return result.Items || [];
+        });
+    },
+
+    fetchCollectionItems: function(api, item) {
+        if (!item || !item.Id) return Promise.resolve({ title: '', items: [] });
+
+        var type = item.Type;
+        var supportsCollections = ['Movie', 'Series', 'BoxSet'];
+        if (supportsCollections.indexOf(type) === -1) {
+            return Promise.resolve({ title: '', items: [] });
+        }
+
+        var userId = api.getCurrentUserId();
+        var serverUrl = api._serverAddress || api.serverAddress();
+        var headers = this.getAuthHeaders();
+        var self = this;
+
+        if (type === 'BoxSet') {
+            return fetch(serverUrl + '/Users/' + userId + '/Items?ParentId=' + item.Id + '&SortBy=SortName&SortOrder=Ascending&Fields=PrimaryImageAspectRatio,UserData', {
+                headers: headers
+            }).then(function(resp) {
+                if (!resp.ok) throw new Error('Failed to fetch boxset items');
+                return resp.json();
+            }).then(function(result) {
+                var items = result.Items || [];
+                return {
+                    title: item.Name || 'Collection',
+                    items: items
+                };
+            });
+        }
+
+        return self._findBoxSetForItem(serverUrl, userId, headers, item).then(function(boxSet) {
+            if (!boxSet || !boxSet.Id) {
+                return { title: '', items: [] };
+            }
+
+            return fetch(serverUrl + '/Users/' + userId + '/Items?ParentId=' + boxSet.Id + '&SortBy=PremiereDate,SortName&SortOrder=Ascending&Fields=PrimaryImageAspectRatio,UserData', {
+                headers: headers
+            }).then(function(itemsResp) {
+                if (!itemsResp.ok) throw new Error('Failed to fetch parent collection items');
+                return itemsResp.json();
+            }).then(function(result) {
+                return {
+                    title: boxSet.Name || 'Collection',
+                    items: result.Items || []
+                };
+            });
+        }).catch(function() {
+            return { title: '', items: [] };
+        });
+    },
+
+    _findBoxSetForItem: function(serverUrl, userId, headers, item) {
+        return fetch(serverUrl + '/Users/' + userId + '/Items?Ids=' + item.Id + '&IncludeItemTypes=Movie,Series,BoxSet&Recursive=true&CollapseBoxSetItems=true&Fields=BasicSyncInfo', {
+            headers: headers
+        }).then(function(resp) {
+            if (!resp.ok) return null;
+            return resp.json();
+        }).then(function(result) {
+            var items = (result && result.Items) || [];
+            for (var i = 0; i < items.length; i++) {
+                if (items[i] && items[i].Type === 'BoxSet' && items[i].Id) {
+                    return items[i];
+                }
+            }
+
+            return fetch(serverUrl + '/Users/' + userId + '/Items?IncludeItemTypes=BoxSet&Recursive=true&SortBy=SortName&Fields=BasicSyncInfo', {
+                headers: headers
+            }).then(function(resp) {
+                if (!resp.ok) return null;
+                return resp.json();
+            }).then(function(boxSetsResult) {
+                var boxSets = (boxSetsResult && boxSetsResult.Items) || [];
+                if (boxSets.length === 0) return null;
+
+                var checkBoxSet = function(index) {
+                    if (index >= boxSets.length) return Promise.resolve(null);
+                    var bs = boxSets[index];
+                    if (!bs || !bs.Id) return checkBoxSet(index + 1);
+
+                    return fetch(serverUrl + '/Users/' + userId + '/Items?ParentId=' + bs.Id + '&Fields=BasicSyncInfo', {
+                        headers: headers
+                    }).then(function(resp) {
+                        if (!resp.ok) return checkBoxSet(index + 1);
+                        return resp.json();
+                    }).then(function(childrenResult) {
+                        var children = (childrenResult && childrenResult.Items) || [];
+                        for (var j = 0; j < children.length; j++) {
+                            if (children[j] && children[j].Id === item.Id) {
+                                return bs;
+                            }
+                        }
+                        return checkBoxSet(index + 1);
+                    });
+                };
+
+                return checkBoxSet(0);
+            });
+        }).catch(function() {
+            return null;
+        });
+    },
+
+    renderDetails: function(item, similar, cast, seasons, episodes, features, collections) {
         var self = this;
         var panel = this.container.querySelector('.moonfin-details-panel');
         var api = API.getApiClient();
@@ -662,10 +840,91 @@ var Details = {
             '</div>';
         }
 
+        var chapters = item.Chapters || [];
+        var chaptersHtml = chapters.length > 0 ? (
+            '<div class="moonfin-section">' +
+                '<div class="moonfin-section-header">' +
+                    '<h3 class="moonfin-section-title">Chapters</h3>' +
+                    arrowsHtml +
+                '</div>' +
+                '<div class="moonfin-section-scroll">' +
+                    chapters.map(function(chapter, index) {
+                        var chapterName = (chapter.Name && chapter.Name.trim()) ? chapter.Name : ('Chapter ' + (index + 1));
+                        var startTicks = chapter.StartPositionTicks || 0;
+                        var chapterTag = chapter.ImageTag ? '&tag=' + encodeURIComponent(chapter.ImageTag) : '';
+                        var chapterImage = serverUrl + '/Items/' + item.Id + '/Images/Chapter/' + index + '?maxWidth=600&quality=80' + chapterTag;
+                        var chapterStart = self.formatTimePosition(startTicks);
+
+                        return '<div class="moonfin-chapter-card moonfin-focusable" data-start-ticks="' + startTicks + '" tabindex="0">' +
+                            '<div class="moonfin-chapter-thumb">' +
+                                '<img src="' + chapterImage + '" alt="" loading="lazy" onerror="this.style.display=\'none\';this.parentNode.classList.add(\'moonfin-chapter-thumb-empty\')">' +
+                            '</div>' +
+                            '<div class="moonfin-chapter-info">' +
+                                '<span class="moonfin-chapter-title">' + chapterName + '</span>' +
+                                '<span class="moonfin-chapter-time">' + chapterStart + '</span>' +
+                            '</div>' +
+                        '</div>';
+                    }).join('') +
+                '</div>' +
+            '</div>'
+        ) : '';
+
+        var featureItems = features || [];
+        var featuresHtml = featureItems.length > 0 ? (
+            '<div class="moonfin-section">' +
+                '<div class="moonfin-section-header">' +
+                    '<h3 class="moonfin-section-title">Features</h3>' +
+                    arrowsHtml +
+                '</div>' +
+                '<div class="moonfin-section-scroll">' +
+                    featureItems.slice(0, 20).map(function(feature) {
+                        var featurePosterTag = feature.ImageTags ? (feature.ImageTags.Primary || feature.ImageTags.Thumb) : null;
+                        var featurePosterUrl = featurePosterTag ? serverUrl + '/Items/' + feature.Id + '/Images/Primary?maxHeight=400&quality=80' : '';
+                        var featureWatched = feature.UserData && feature.UserData.Played;
+                        return '<div class="moonfin-similar-card moonfin-focusable" data-item-id="' + feature.Id + '" data-type="' + (feature.Type || 'Video') + '" tabindex="0">' +
+                            '<div class="moonfin-similar-poster">' +
+                                (featurePosterUrl ? '<img src="' + featurePosterUrl + '" alt="" loading="lazy">' : '') +
+                                (featureWatched ? '<div class="moonfin-watched-indicator"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 7L9 19l-5.5-5.5 1.41-1.41L9 16.17 19.59 5.59 21 7z"/></svg></div>' : '') +
+                            '</div>' +
+                            '<span class="moonfin-similar-title">' + (feature.Name || 'Feature') + '</span>' +
+                        '</div>';
+                    }).join('') +
+                '</div>' +
+            '</div>'
+        ) : '';
+
+        var collectionTitle = collections && collections.title ? collections.title : 'Collection';
+        var collectionItems = collections && collections.items ? collections.items : [];
+        var collectionsHtml = collectionItems.length > 0 ? (
+            '<div class="moonfin-section">' +
+                '<div class="moonfin-section-header">' +
+                    '<h3 class="moonfin-section-title">' + collectionTitle + '</h3>' +
+                    arrowsHtml +
+                '</div>' +
+                '<div class="moonfin-section-scroll">' +
+                    collectionItems.slice(0, 30).map(function(col) {
+                        var colPosterTag = col.ImageTags ? (col.ImageTags.Primary || col.ImageTags.Thumb) : null;
+                        var colPosterUrl = colPosterTag ? serverUrl + '/Items/' + col.Id + '/Images/Primary?maxHeight=400&quality=80' : '';
+                        var colWatched = col.UserData && col.UserData.Played;
+                        return '<div class="moonfin-similar-card moonfin-focusable" data-item-id="' + col.Id + '" data-type="' + (col.Type || '') + '" tabindex="0">' +
+                            '<div class="moonfin-similar-poster">' +
+                                (colPosterUrl ? '<img src="' + colPosterUrl + '" alt="" loading="lazy">' : '') +
+                                (colWatched ? '<div class="moonfin-watched-indicator"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 7L9 19l-5.5-5.5 1.41-1.41L9 16.17 19.59 5.59 21 7z"/></svg></div>' : '') +
+                            '</div>' +
+                            '<span class="moonfin-similar-title">' + (col.Name || '') + '</span>' +
+                        '</div>';
+                    }).join('') +
+                '</div>' +
+            '</div>'
+        ) : '';
+
+        var backdrop = this.container.querySelector('.moonfin-details-backdrop');
+        if (backdrop) {
+            backdrop.style.backgroundImage = 'url(\'' + backdropUrl + '\')';
+            backdrop.className = 'moonfin-details-backdrop';
+        }
+
         panel.innerHTML = 
-            '<div class="moonfin-details-backdrop" style="background-image: url(\'' + backdropUrl + '\')"></div>' +
-            '<div class="moonfin-details-gradient"></div>' +
-            
             '<button class="moonfin-details-back moonfin-focusable" title="Back" tabindex="0">' +
                 '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>' +
             '</button>' +
@@ -697,8 +956,11 @@ var Details = {
                 metadataHtml +
                 
                 '<div class="moonfin-sections">' +
+                    collectionsHtml +
                     seasonsHtml +
                     episodesHtml +
+                    chaptersHtml +
+                    featuresHtml +
                     
                     (cast.length > 0 ? 
                         '<div class="moonfin-section">' +
@@ -720,6 +982,7 @@ var Details = {
                 '</div>' +
             '</div>';
 
+        this.applyBackdropSettings();
         this.setupPanelListeners(panel, item);
     },
 
@@ -766,6 +1029,21 @@ var Details = {
         var hours = Math.floor(minutes / 60);
         var mins = minutes % 60;
         return mins > 0 ? hours + 'h ' + mins + 'm' : hours + 'h';
+    },
+
+    formatTimePosition: function(ticks) {
+        var totalSeconds = Math.floor((ticks || 0) / 10000000);
+        var hours = Math.floor(totalSeconds / 3600);
+        var minutes = Math.floor((totalSeconds % 3600) / 60);
+        var seconds = totalSeconds % 60;
+
+        var mm = minutes < 10 ? '0' + minutes : '' + minutes;
+        var ss = seconds < 10 ? '0' + seconds : '' + seconds;
+        if (hours > 0) {
+            var hh = hours < 10 ? '0' + hours : '' + hours;
+            return hh + ':' + mm + ':' + ss;
+        }
+        return mm + ':' + ss;
     },
 
     toggleFavorite: function(item) {
@@ -878,6 +1156,18 @@ var Details = {
                     self.showDetails(epId, 'Episode');
                 });
             })(episodeCards[n]);
+        }
+
+        var chapterCards = panel.querySelectorAll('.moonfin-chapter-card');
+        for (var o = 0; o < chapterCards.length; o++) {
+            (function(card) {
+                card.addEventListener('click', function() {
+                    var startTicks = parseInt(card.getAttribute('data-start-ticks') || '0', 10);
+                    if (isNaN(startTicks)) startTicks = 0;
+                    self.hide(true);
+                    self.playItem(item.Id, startTicks, self._selectedAudioIndex, self._selectedSubtitleIndex, self._selectedMediaSourceId);
+                });
+            })(chapterCards[o]);
         }
 
         var personCards = panel.querySelectorAll('.moonfin-cast-card');
@@ -1093,42 +1383,237 @@ var Details = {
 
     playTrailer: function(item) {
         var self = this;
-        var api = API.getApiClient();
+        this.resolveTrailerSource(item).then(function(source) {
+            if (!source) {
+                self.playLocalTrailer(item);
+                return;
+            }
+            self.openTrailerOverlay(source, item.Name || 'Trailer');
+        }).catch(function(err) {
+            console.error('[Moonfin] Details: Failed to open trailer', err);
+            self.playLocalTrailer(item);
+        });
+    },
 
-        // Try local trailers first
-        if (item.LocalTrailerCount > 0) {
-            var userId = api.getCurrentUserId();
-            var serverUrl = this.getServerUrl();
-            var headers = this.getAuthHeaders();
+    resolveTrailerSource: function(item) {
+        var self = this;
+        var existingUrl = this.getFirstTrailerUrl(item.RemoteTrailers);
+        if (existingUrl) return Promise.resolve(this.buildTrailerSource(existingUrl));
 
-            fetch(serverUrl + '/Users/' + userId + '/Items/' + item.Id + '/LocalTrailers', {
-                headers: headers
-            }).then(function(resp) {
-                return resp.json();
-            }).then(function(trailers) {
-                if (trailers && trailers.length > 0) {
-                    self.hide(true);
-                    self.playItem(trailers[0].Id, 0);
-                }
-            }).catch(function(err) {
-                console.error('[Moonfin] Details: Failed to load local trailers', err);
-                // Fall back to remote trailers
-                self.openRemoteTrailer(item);
+        return API.getItemTrailers(item.Id).then(function(trailers) {
+            item.RemoteTrailers = trailers || [];
+            var url = self.getFirstTrailerUrl(item.RemoteTrailers);
+            return url ? self.buildTrailerSource(url) : null;
+        }).catch(function() {
+            return null;
+        });
+    },
+
+    buildTrailerSource: function(url) {
+        var videoId = this.extractYouTubeIdFromUrl(url);
+        if (videoId) {
+            return { type: 'youtube', videoId: videoId };
+        }
+        return { type: 'iframe', url: url };
+    },
+
+    getFirstTrailerUrl: function(trailers) {
+        if (!trailers || !trailers.length) return null;
+        for (var i = 0; i < trailers.length; i++) {
+            var trailer = trailers[i] || {};
+            var url = trailer.Url || trailer.url;
+            if (url) return url;
+        }
+        return null;
+    },
+
+    extractYouTubeIdFromUrl: function(url) {
+        if (!url) return null;
+        var match = url.match(/(?:youtube\.com\/(?:watch\?v=|embed\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+        return match ? match[1] : null;
+    },
+
+    openTrailerOverlay: function(source, title) {
+        var self = this;
+        this.closeTrailerOverlay();
+
+        var overlay = document.createElement('div');
+        overlay.className = 'moonfin-trailer-overlay';
+        overlay.innerHTML =
+            '<div class="moonfin-trailer-modal" role="dialog" aria-modal="true" aria-label="' + (title || 'Trailer') + '">' +
+                '<button class="moonfin-trailer-close moonfin-focusable" aria-label="Close trailer" tabindex="0">' +
+                    '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.71 12 12l6.3 6.29-1.41 1.42L10.59 13.4 4.29 19.71 2.88 18.3 9.17 12 2.88 5.71 4.29 4.29l6.3 6.3 6.29-6.3z"/></svg>' +
+                '</button>' +
+                '<div class="moonfin-trailer-player-host"></div>' +
+            '</div>';
+
+        overlay.addEventListener('click', function(e) {
+            if (e.target === overlay) {
+                self.closeTrailerOverlay();
+            }
+        });
+
+        var closeBtn = overlay.querySelector('.moonfin-trailer-close');
+        if (closeBtn) {
+            closeBtn.addEventListener('click', function() {
+                self.closeTrailerOverlay();
             });
+        }
+
+        this._trailerEscHandler = function(e) {
+            if (e.key === 'Escape' || e.keyCode === 27 || e.keyCode === 461 || e.keyCode === 10009) {
+                e.preventDefault();
+                e.stopPropagation();
+                self.closeTrailerOverlay();
+            }
+        };
+
+        this._trailerPreviousFocus = document.activeElement;
+        this._trailerOverlay = overlay;
+        document.addEventListener('keydown', this._trailerEscHandler, true);
+        document.body.appendChild(overlay);
+
+        this.loadTrailerOverlayPlayer(source);
+
+        setTimeout(function() {
+            if (closeBtn) closeBtn.focus();
+        }, 0);
+    },
+
+    loadTrailerOverlayPlayer: function(source) {
+        if (!this._trailerOverlay) return;
+
+        var host = this._trailerOverlay.querySelector('.moonfin-trailer-player-host');
+        if (!host) return;
+
+        if (source.type === 'youtube' && source.videoId) {
+            this._loadTrailerYouTubePlayer(host, source.videoId);
             return;
         }
 
-        // Fall back to remote trailers
-        this.openRemoteTrailer(item);
+        host.innerHTML =
+            '<iframe class="moonfin-trailer-iframe visible" src="' + source.url + '" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen loading="eager" referrerpolicy="origin"></iframe>';
     },
 
-    openRemoteTrailer: function(item) {
-        if (item.RemoteTrailers && item.RemoteTrailers.length > 0) {
-            var url = item.RemoteTrailers[0].Url;
-            if (url) {
-                window.open(url, '_blank', 'noopener');
-            }
+    _ensureYTApi: function(callback) {
+        if (window.YT && window.YT.Player) {
+            callback();
+            return;
         }
+
+        if (!document.querySelector('script[src*="youtube.com/iframe_api"]')) {
+            var tag = document.createElement('script');
+            tag.src = 'https://www.youtube.com/iframe_api';
+            document.head.appendChild(tag);
+        }
+
+        var checkInterval = setInterval(function() {
+            if (window.YT && window.YT.Player) {
+                clearInterval(checkInterval);
+                callback();
+            }
+        }, 100);
+
+        setTimeout(function() { clearInterval(checkInterval); }, 10000);
+    },
+
+    _loadTrailerYouTubePlayer: function(host, videoId) {
+        var self = this;
+        host.innerHTML = '<div class="moonfin-trailer-loading"><div class="moonfin-spinner"></div><span>Loading trailer...</span></div>';
+
+        this._ensureYTApi(function() {
+            if (!self._trailerOverlay) return;
+
+            if (self._trailerPlayer) {
+                try { self._trailerPlayer.destroy(); } catch(e) {}
+                self._trailerPlayer = null;
+            }
+
+            var playerDiv = document.createElement('div');
+            playerDiv.id = 'moonfin-details-yt-player-' + Date.now();
+            playerDiv.className = 'moonfin-trailer-iframe';
+            host.innerHTML = '';
+            host.appendChild(playerDiv);
+
+            try {
+                self._trailerPlayer = new YT.Player(playerDiv.id, {
+                    videoId: videoId,
+                    playerVars: {
+                        autoplay: 1,
+                        controls: 1,
+                        rel: 0,
+                        modestbranding: 1,
+                        playsinline: 1,
+                        iv_load_policy: 3,
+                        fs: 1,
+                        origin: window.location.origin
+                    },
+                    events: {
+                        onReady: function(event) {
+                            event.target.playVideo();
+                            var iframe = host.querySelector('iframe');
+                            if (iframe) iframe.classList.add('visible');
+                        },
+                        onError: function(event) {
+                            console.warn('[Moonfin] Details: YouTube player error:', event.data);
+                            host.innerHTML = '<div class="moonfin-details-error"><span>Unable to load trailer</span></div>';
+                        }
+                    }
+                });
+            } catch(e) {
+                console.warn('[Moonfin] Details: Failed to create YouTube player:', e);
+                host.innerHTML = '<div class="moonfin-details-error"><span>Unable to load trailer</span></div>';
+            }
+        });
+    },
+
+    closeTrailerOverlay: function() {
+        if (!this._trailerOverlay) return false;
+
+        if (this._trailerEscHandler) {
+            document.removeEventListener('keydown', this._trailerEscHandler, true);
+            this._trailerEscHandler = null;
+        }
+
+        if (this._trailerPlayer) {
+            try { this._trailerPlayer.destroy(); } catch(e) {}
+            this._trailerPlayer = null;
+        }
+
+        var iframe = this._trailerOverlay.querySelector('.moonfin-trailer-iframe');
+        if (iframe && iframe.tagName === 'IFRAME') iframe.src = 'about:blank';
+
+        this._trailerOverlay.remove();
+        this._trailerOverlay = null;
+
+        if (this._trailerPreviousFocus && typeof this._trailerPreviousFocus.focus === 'function') {
+            this._trailerPreviousFocus.focus();
+        }
+        this._trailerPreviousFocus = null;
+        return true;
+    },
+
+    playLocalTrailer: function(item) {
+        var self = this;
+        if (!item.LocalTrailerCount || item.LocalTrailerCount <= 0) return;
+
+        var api = API.getApiClient();
+        var userId = api.getCurrentUserId();
+        var serverUrl = this.getServerUrl();
+        var headers = this.getAuthHeaders();
+
+        fetch(serverUrl + '/Users/' + userId + '/Items/' + item.Id + '/LocalTrailers', {
+            headers: headers
+        }).then(function(resp) {
+            return resp.json();
+        }).then(function(trailers) {
+            if (trailers && trailers.length > 0) {
+                self.hide(true);
+                self.playItem(trailers[0].Id, 0);
+            }
+        }).catch(function(err) {
+            console.error('[Moonfin] Details: Failed to load local trailers', err);
+        });
     },
 
     handleAction: function(action, item) {
@@ -2246,10 +2731,13 @@ var Details = {
             '</div>';
         }).join('');
 
-        panel.innerHTML =
-            '<div class="moonfin-details-backdrop" style="background-image: url(\'' + backdropUrl + '\')"></div>' +
-            '<div class="moonfin-details-gradient"></div>' +
+        var backdrop = this.container.querySelector('.moonfin-details-backdrop');
+        if (backdrop) {
+            backdrop.style.backgroundImage = 'url(\'' + backdropUrl + '\')';
+            backdrop.className = 'moonfin-details-backdrop';
+        }
 
+        panel.innerHTML =
             '<button class="moonfin-details-back moonfin-focusable" title="Back" tabindex="0">' +
                 '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>' +
             '</button>' +
@@ -2271,6 +2759,7 @@ var Details = {
                 '</div>' +
             '</div>';
 
+        this.applyBackdropSettings();
         this.setupSeasonPanelListeners(panel, item, episodes);
 
         if (Tmdb.isEnabled() && item.SeriesId) {
@@ -2489,10 +2978,13 @@ var Details = {
             '</div>'
         ) : '';
 
-        panel.innerHTML =
-            '<div class="moonfin-details-backdrop moonfin-person-backdrop"></div>' +
-            '<div class="moonfin-details-gradient"></div>' +
+        var backdrop = this.container.querySelector('.moonfin-details-backdrop');
+        if (backdrop) {
+            backdrop.style.backgroundImage = '';
+            backdrop.className = 'moonfin-details-backdrop moonfin-person-backdrop';
+        }
 
+        panel.innerHTML =
             '<button class="moonfin-details-back moonfin-focusable" title="Back" tabindex="0">' +
                 '<svg viewBox="0 0 24 24"><path fill="currentColor" d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg>' +
             '</button>' +
@@ -2515,6 +3007,7 @@ var Details = {
                 '</div>' +
             '</div>';
 
+        this.applyBackdropSettings();
         this.setupPersonPanelListeners(panel, item);
     },
 
@@ -2538,12 +3031,14 @@ var Details = {
 
     hide: function(skipHistoryBack) {
         if (!this.isVisible) return;
+        this.closeTrailerOverlay();
         this.container.classList.remove('visible');
         this.isVisible = false;
         this.currentItem = null;
+        this._itemHistory = [];
         document.body.classList.remove('moonfin-details-visible');
+        this._updateBackButtons();
 
-        // Pop the history entry we pushed, unless caller will handle navigation
         if (!skipHistoryBack) {
             try { history.back(); } catch(e) {}
         }
